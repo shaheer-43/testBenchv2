@@ -10,10 +10,10 @@ from PIL import Image, ImageTk
 
 # Sensor Imports
 
-from sensors.ESC import cut_throttle, restart_throttle
-from sensors.servos import set_servo_angle, toggle_choke
-from sensors.temp import read_temp
+from sensors.ESC import cut_throttle, run_starter, stop_starter
+from sensors.servos import set_throttle_percent, kill_throttle, reset_kill, toggle_choke
 from sensors.rpm import read_rpm
+from sensors.temp import read_temp
 from sensors.load_cell import read_load_cells
 from sensors.flow import read_flow
 
@@ -68,10 +68,12 @@ class SensorGUI:
         self.style.configure('Success.TLabel', foreground='white', background='#28a745', font=('Inter', 9))
 
         # --- Data Storage and Logic Variables ---
-        self.sensor_active = True  # True means engine is running/ready to poll (initial state)
-        self.choke_state = tk.BooleanVar(value=False) # False means Choke: Closed (initial state)
-        self.throttle_var = tk.DoubleVar(value=90.0)
-        self.percent_text = tk.StringVar(value=f"{int(self.throttle_var.get())}°")
+        # Engine state: 'idle' | 'starting' | 'running' | 'killed'
+        self.engine_state = 'idle'
+        self.choke_state = tk.BooleanVar(value=False)  # False = Choke closed
+        self.throttle_var = tk.DoubleVar(value=0.0)    # 0–100 %
+        self.percent_text = tk.StringVar(value="0%")
+        self.slider_enabled = False  # Slider locked until engine is running
 
         self.sensor_data = {
             "Temperature": deque(maxlen=20), "RPM": deque(maxlen=20),
@@ -111,8 +113,8 @@ class SensorGUI:
         self.root.after(0, self.poll_sensors)
         self.root.protocol("WM_DELETE_WINDOW", self.save_data_and_close)
         
-        # Initialize indicator colors (Cut/Restart starts ready/green)
-        self.update_cut_restart_indicators() 
+        # Initialize button states
+        self._update_engine_buttons()
 
     def create_indicator_block(self, parent, data_key, label_text, unit, row, col):
         """Creates one of the four top bordered display blocks with current and avg data."""
@@ -257,11 +259,29 @@ class SensorGUI:
         )
         self.thrust_value_label.pack(expand=True, fill='both')
 
-        # 2c. Cut/Restart Control Block (Starts Active/Green)
-        self.cut_restart_text = tk.StringVar(value="State: Cut")
-        self.control_widgets['cut_restart'] = self.setup_control_block(
-            self.center_frame, "Starter", self.toggle_cut_restart, self.cut_restart_text, 'cut_restart'
+        # 2c. Engine Start / Kill buttons
+        engine_btn_frame = ttk.Frame(self.center_frame, padding=8, relief='solid', borderwidth=2, style='Custom.TFrame')
+        engine_btn_frame.pack(side='left', padx=25, pady=10, fill='both', expand=True)
+
+        ttk.Label(engine_btn_frame, text="Engine", font=('Inter', 12, 'bold'), foreground='#333').pack(pady=(0, 5))
+
+        self.start_button = ttk.Button(
+            engine_btn_frame, text="START",
+            command=self.start_engine,
+            bootstyle='success', width=14
         )
+        self.start_button.pack(pady=(4, 4), fill='x', padx=8)
+
+        self.kill_button = ttk.Button(
+            engine_btn_frame, text="KILL",
+            command=self.kill_engine,
+            bootstyle='danger', width=14
+        )
+        self.kill_button.pack(pady=(4, 4), fill='x', padx=8)
+
+        self.engine_status_text = tk.StringVar(value="State: Idle")
+        ttk.Label(engine_btn_frame, textvariable=self.engine_status_text,
+                  font=('Inter', 9), foreground='#555').pack(pady=(2, 0))
 
         # 3. Status Label
         self.status_label_text = tk.StringVar(value="")
@@ -410,17 +430,15 @@ class SensorGUI:
         self._update_handle_position(new_x)
         
     def _value_to_x(self, value):
-        """Convert slider value (40-120) to canvas x coordinate."""
-        normalized = (value - 40) / (120 - 40)
+        """Convert slider value (0–100%) to canvas x coordinate."""
+        normalized = value / 100.0
         return self.track_start_x + normalized * self.track_width
-        
+
     def _x_to_value(self, x):
-        """Convert canvas x coordinate to slider value (40-120)."""
-        # Clamp x to track bounds
+        """Convert canvas x coordinate to slider value (0–100%)."""
         x = max(self.track_start_x, min(x, self.track_end_x))
         normalized = (x - self.track_start_x) / self.track_width
-        value = 40 + normalized * (120 - 40)
-        return max(40, min(120, value))
+        return max(0.0, min(100.0, normalized * 100.0))
         
     def _update_handle_position(self, x):
         """Update the position of the slider handle and filled track."""
@@ -506,32 +524,34 @@ class SensorGUI:
     # --- Control Handlers ---
 
     def on_throttle_change(self, event=None):
-        """Updates throttle angle display and clears all accumulated data."""
-        throttle_value = int(self.throttle_var.get())
-        angle_text = f"{throttle_value}°"
-        self.update_servo_angle(throttle_value)
-        
-        self.percent_text.set(angle_text) 
-        
-        # LOGIC: As required by the original logic, changing the throttle setting MUST clear the data.
+        """Updates throttle display and sends percent to servo. Locked when slider disabled."""
+        if not self.slider_enabled:
+            return
+        throttle_pct = round(self.throttle_var.get(), 1)
+        self.percent_text.set(f"{throttle_pct:.0f}%")
+        set_throttle_percent(throttle_pct)
         self.clear_data()
         self.waiting_for_readings = 0
-    
-    def update_servo_angle(self, angle=None):
-        if angle is None:
-            angle = int(self.throttle_var.get())
 
-        set_servo_angle(18, angle)
+    def update_servo_angle(self, percent=None):
+        """Send a throttle percent to the servo (used internally)."""
+        if percent is None:
+            percent = round(self.throttle_var.get(), 1)
+        set_throttle_percent(percent)
 
     def increment_throttle(self):
-        new_value = min(120, self.throttle_var.get() + 1)
+        if not self.slider_enabled:
+            return
+        new_value = min(100.0, self.throttle_var.get() + 1)
         self.throttle_var.set(new_value)
         if hasattr(self, 'slider_canvas'):
             self._update_handle_position(self._value_to_x(new_value))
         self.on_throttle_change()
 
     def decrement_throttle(self):
-        new_value = max(40, self.throttle_var.get() - 1)
+        if not self.slider_enabled:
+            return
+        new_value = max(0.0, self.throttle_var.get() - 1)
         self.throttle_var.set(new_value)
         if hasattr(self, 'slider_canvas'):
             self._update_handle_position(self._value_to_x(new_value))
@@ -568,38 +588,74 @@ class SensorGUI:
             self.status_label_text.set("Choke CLOSED. Data Cleared.")
             self.status_label.config(style='Success.TLabel')
 
-    def update_cut_restart_indicators(self):
-        """Helper to update the visual state of the Cut/Restart block."""
-        cut_control = self.control_widgets['cut_restart']
-        green_canvas = cut_control['green_canvas']
-        red_canvas = cut_control['red_canvas']
-        green_id = cut_control['green_id']
-        red_id = cut_control['red_id']
+    def _update_engine_buttons(self):
+        """Enable/disable Start and Kill buttons based on engine state."""
+        state = self.engine_state
+        # Start only available when idle or killed
+        start_state = 'normal' if state in ('idle', 'killed') else 'disabled'
+        # Kill available whenever engine is starting or running
+        kill_state = 'normal' if state in ('starting', 'running') else 'disabled'
+        self.start_button.config(state=start_state)
+        self.kill_button.config(state=kill_state)
+        self.engine_status_text.set(f"State: {state.capitalize()}")
 
-        is_active = self.sensor_active
-        green_canvas.itemconfig(green_id, fill='lightgreen' if is_active else 'gray')
-        red_canvas.itemconfig(red_id, fill='gray' if is_active else 'red')
-        
-    def toggle_cut_restart(self):
-        """Toggles the engine active state, manages polling and data clearing."""
-        
-        # LOGIC FIX: Invert the state
-        self.sensor_active = not self.sensor_active
-        self.update_cut_restart_indicators()
+    def start_engine(self):
+        """
+        Start sequence:
+          1. Set throttle servo to 25%
+          2. Run ESC starter at 100% in background thread
+          3. When RPM >= 3000, starter cuts — GUI transitions to 'running'
+        """
+        self.engine_state = 'starting'
+        self._update_engine_buttons()
+        self.slider_enabled = False
+        self.status_label_text.set("Starting engine — cranking...")
+        self.status_label.config(style='Danger.TLabel')
 
-        if self.sensor_active:
-            # Engine is now ACTIVE (Restarted)
-            self.cut_restart_text.set("State: Cut") 
-            restart_throttle()
-            self.status_label_text.set("Engine Restarted. Sensor Polling Active.")
-            self.status_label.config(style='Success.TLabel')
-        else:
-            # Engine is now INACTIVE (Cut)
-            self.cut_restart_text.set("State: Restart") 
-            cut_throttle()
-            #self.clear_data()
-            self.status_label_text.set("Engine Cut. Sensor Polling Paused. Data Cleared.")
-            self.status_label.config(style='Danger.TLabel')
+        # Set throttle to 25% for start
+        reset_kill()
+        set_throttle_percent(25)
+        self.throttle_var.set(25)
+        self.percent_text.set("25%")
+        if hasattr(self, 'slider_canvas'):
+            self._update_handle_position(self._value_to_x(25))
+
+        def get_rpm():
+            return read_rpm(duration=0.2)['rpm']
+
+        def on_starter_complete():
+            # Called from background thread — schedule GUI update on main thread
+            self.root.after(0, self._on_engine_started)
+
+        run_starter(rpm_callback=get_rpm, on_complete=on_starter_complete)
+
+    def _on_engine_started(self):
+        """Called on the main thread once RPM threshold is reached."""
+        self.engine_state = 'running'
+        self.slider_enabled = True
+        self._update_engine_buttons()
+        self.status_label_text.set("Engine running — starter cut at 3000 RPM.")
+        self.status_label.config(style='Success.TLabel')
+
+    def kill_engine(self):
+        """
+        Hard kill:
+          - Stop starter thread if still running
+          - Drive throttle servo to 0% (minimum pulse) and lock slider
+          - Cut ESC
+        """
+        stop_starter()
+        kill_throttle()
+        cut_throttle()
+        self.engine_state = 'killed'
+        self.slider_enabled = False
+        self.throttle_var.set(0)
+        self.percent_text.set("0%")
+        if hasattr(self, 'slider_canvas'):
+            self._update_handle_position(self._value_to_x(0))
+        self._update_engine_buttons()
+        self.status_label_text.set("ENGINE KILLED — throttle at 0%.")
+        self.status_label.config(style='Danger.TLabel')
 
     # --- Polling Logic ---
 
@@ -610,7 +666,7 @@ class SensorGUI:
             
         should_poll = False
 
-        if True:
+        if self.engine_state == 'running':
             if self.choke_state.get():
                 # Choke is OPEN: Enforce delay logic
                 if self.waiting_for_readings > 0:
@@ -695,6 +751,15 @@ class SensorGUI:
             except Exception as e:
                 self.show_modal("File Error", f"Failed to save data to Excel. Error: {e}", style='danger', size=(400, 200))
         
+        # Clean up hardware before closing
+        try:
+            from sensors.servos import cleanup as servo_cleanup
+            from sensors.ESC import cleanup as esc_cleanup
+            servo_cleanup()
+            esc_cleanup()
+        except Exception:
+            pass
+
         # Close the application cleanly
         self.root.quit()
         self.root.destroy()
