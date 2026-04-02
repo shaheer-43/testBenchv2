@@ -9,14 +9,16 @@ import time
 from PIL import Image, ImageTk
 
 # Sensor Imports
-#from sensors.ESC import cut_throttle, restart_throttle
-#from sensors.servos import set_servo_angle, toggle_choke
-#from sensors.temp import read_temp
-#from sensors.rpm import read_rpm
-#from sensors.load_cell import read_load_cells
-#from sensors.flow import read_flow
+
+from sensors.ESC import cut_throttle, restart_throttle
+from sensors.servos import set_servo_angle, toggle_choke
+from sensors.temp import read_temp
+from sensors.rpm import read_rpm
+from sensors.load_cell import read_load_cells
+from sensors.flow import read_flow
 
 # --- Mock Sensor Functions ---
+'''
 def read_sensors():
     """Mocks reading all sensor values."""
     sensor_values = {
@@ -25,31 +27,30 @@ def read_sensors():
         # RPM between 0 and 6000 rpm
         "RPM": random.randint(0, 6000),
         # Load cells produce forces, say between -1000 and 1000 N
-        "Load Cell 1": round(random.uniform(-1000, 1000), 2),
+        "Load Cell 1": load_cell_dict['Load Cell 1 (Raw)'],
         "Load Cell 2": round(random.uniform(-1000, 1000), 2),
         # Flow sensors: 0–2000 g/min and 0–20 L/min
         "grams_per_min": round(random.uniform(0, 2000), 2),
         "liters_per_min": round(random.uniform(0, 20), 2)
     }
     return sensor_values
+'''
 
 # Read all sensor values (real implementation)
-'''
 def read_sensors():
-    temp_dict = read_temp()
+    #temp_dict = read_temp()
     rpm_dict = read_rpm()
     load_cell_dict = read_load_cells()
-    flow_dict = read_flow()
+    #flow_dict = read_flow()
 
     return {
-        "Temperature": temp_dict['target_temp'],
+        "Temperature": round(random.uniform(15, 100), 2),
         "RPM": rpm_dict['rpm'],
         "Load Cell 1": load_cell_dict['Load Cell 1 (Raw)'],
         "Load Cell 2": load_cell_dict['Load Cell 2 (Raw)'],
-        "grams_per_min": flow_dict['grams_per_min'],
-        "liters_per_min": flow_dict['liters_per_min']
+        "grams_per_min": round(random.uniform(0, 2000), 2),
+        "liters_per_min": round(random.uniform(0, 2000), 2)
     }
-'''
 
 # --- GUI Implementation ---
 class SensorGUI:
@@ -88,7 +89,7 @@ class SensorGUI:
         
         self.display_widgets['Load Cell 1'] = {
             'current': tk.StringVar(value=f"0"), 'avg': tk.StringVar(value=""), 'unit': "N"
-        }
+         }
 
         self.display_widgets['Temperature'] = {
             'current': tk.StringVar(value=f"0"), 'avg': tk.StringVar(value=""), 'unit': "°C"
@@ -514,12 +515,13 @@ class SensorGUI:
         
         # LOGIC: As required by the original logic, changing the throttle setting MUST clear the data.
         self.clear_data()
+        self.waiting_for_readings = 0
     
     def update_servo_angle(self, angle=None):
         if angle is None:
             angle = int(self.throttle_var.get())
 
-        #set_servo_angle(18, angle)
+        set_servo_angle(18, angle)
 
     def increment_throttle(self):
         new_value = min(120, self.throttle_var.get() + 1)
@@ -588,14 +590,14 @@ class SensorGUI:
         if self.sensor_active:
             # Engine is now ACTIVE (Restarted)
             self.cut_restart_text.set("State: Cut") 
-            #restart_throttle()
+            restart_throttle()
             self.status_label_text.set("Engine Restarted. Sensor Polling Active.")
             self.status_label.config(style='Success.TLabel')
         else:
             # Engine is now INACTIVE (Cut)
             self.cut_restart_text.set("State: Restart") 
-            #cut_throttle()
-            self.clear_data()
+            cut_throttle()
+            #self.clear_data()
             self.status_label_text.set("Engine Cut. Sensor Polling Paused. Data Cleared.")
             self.status_label.config(style='Danger.TLabel')
 
@@ -608,7 +610,7 @@ class SensorGUI:
             
         should_poll = False
 
-        if self.sensor_active:
+        if True:
             if self.choke_state.get():
                 # Choke is OPEN: Enforce delay logic
                 if self.waiting_for_readings > 0:
@@ -636,10 +638,10 @@ class SensorGUI:
                 self._process_and_update_values(values)
                 self.status_label_text.set(f"Sampling Active.")
                 self.status_label.config(style='Success.TLabel')
-        elif not self.sensor_active:
+        #elif not self.sensor_active:
             # Update status if engine is cut
-            self.status_label_text.set("Engine CUT. Polling Paused.")
-            self.status_label.config(style='Danger.TLabel')
+           # self.status_label_text.set("Engine CUT. Polling Paused.")
+           # self.status_label.config(style='Danger.TLabel')
         
         # If the status was updated by the choke delay, don't overwrite it here.
         
