@@ -10,13 +10,16 @@ import time
 from PIL import Image, ImageTk
 
 # Sensor Imports
-
-from sensors.ESC import cut_throttle, run_starter, stop_starter
-from sensors.servos import set_throttle_percent, kill_throttle, reset_kill, toggle_choke
-from sensors.rpm import read_rpm
-from sensors.temp import read_temp
-from sensors.load_cell import read_load_cells
-from sensors.flow import read_flow
+try:
+    from sensors.ESC import cut_throttle, run_starter, stop_starter
+    from sensors.servos import set_throttle_percent, kill_throttle, reset_kill, toggle_choke as servo_toggle_choke
+    from sensors.rpm import read_rpm
+    from sensors.temp import read_temp
+    from sensors.load_cell import read_load_cells
+    from sensors.flow import read_flow
+except Exception as _import_err:
+    print(f"WARNING: Sensor import failed — {_import_err}")
+    print("Running in degraded mode. Hardware calls will fail at runtime.")
 
 # --- Mock Sensor Functions ---
 '''
@@ -40,7 +43,7 @@ def read_sensors():
 # Read all sensor values (real implementation)
 def read_sensors():
     #temp_dict = read_temp()
-    rpm_dict = read_rpm()
+    rpm_dict = read_rpm(duration=0.5)  # 0.5s window — avoids 1s GUI freeze
     load_cell_dict = read_load_cells()
     #flow_dict = read_flow()
 
@@ -60,7 +63,7 @@ class SensorGUI:
         self.root = root
         self.style = Style(theme='flatly') 
         root.title("Engine Control Panel Dashboard")
-        root.geometry("1000x550")
+        root.geometry("1000x620")
         
         # Configure custom styles
         self.style.configure('Custom.TFrame', background='white', bordercolor='#003366', relief='flat', borderwidth=2, border_radius=10)
@@ -97,6 +100,7 @@ class SensorGUI:
         # Shared stop event — set by Kill or a manual cancel to abort any running profile
         self._profile_stop = threading.Event()
         self._profile_thread = None
+        self._profile_running = False  # True while step or ramp is active; suppresses data clearing
 
         self.display_widgets = {} 
         self.control_widgets = {}
@@ -572,19 +576,21 @@ class SensorGUI:
         
     # --- Control Handlers ---
 
-    def on_throttle_change(self, event=None):
-        """Updates throttle. If a profile is running, cancels it and takes manual control."""
+    def on_throttle_change(self, event=None, from_profile=False):
+        """Updates throttle. If a profile is running and manual input occurs, cancels profile."""
         if not self.slider_enabled:
             return
-        # If a profile is active, cancel it — manual input takes over
-        if self._profile_thread and self._profile_thread.is_alive():
+        # Manual input while a profile is running — cancel the profile
+        if not from_profile and self._profile_thread and self._profile_thread.is_alive():
             self._stop_profile()
             self._on_profile_finished(cancelled=True)
         throttle_pct = round(self.throttle_var.get(), 1)
         self.percent_text.set(f"{throttle_pct:.0f}%")
         set_throttle_percent(throttle_pct)
-        self.clear_data()
-        self.waiting_for_readings = 0
+        # Only clear data on manual throttle changes, not during profiles
+        if not self._profile_running:
+            self.clear_data()
+            self.waiting_for_readings = 0
 
     def update_servo_angle(self, percent=None):
         """Send a throttle percent to the servo (used internally)."""
@@ -623,20 +629,20 @@ class SensorGUI:
         red_canvas.itemconfig(red_id, fill='gray' if is_open else 'red')
         
     def toggle_choke(self):
-        """Toggles the choke state and manages the initial delay."""
+        """Toggles the choke state, updates indicators, and drives the choke servo."""
         current_state = self.choke_state.get()
         self.choke_state.set(not current_state)
         self.update_choke_indicators()
 
         if self.choke_state.get():
-            # Choke is now OPEN (ON) - start delay, set button text to "Choke: Open"
             self.choke_text.set("Choke: Open")
+            servo_toggle_choke(True)   # Drive choke servo open
             self.waiting_for_readings = self.wait_time_after_choke
             self.status_label_text.set(f"Choke OPEN. Starting {self.wait_time_after_choke}s delay...")
             self.status_label.config(style='Danger.TLabel')
         else:
-            # Choke is now CLOSED (OFF) - clear data, set button text to "Choke: Closed"
             self.choke_text.set("Choke: Closed")
+            servo_toggle_choke(False)  # Drive choke servo closed
             self.clear_data()
             self.status_label_text.set("Choke CLOSED. Data Cleared.")
             self.status_label.config(style='Success.TLabel')
@@ -730,10 +736,9 @@ class SensorGUI:
         self.root.after(0, _do)
 
     def _stop_profile(self):
-        """Signal any running profile thread to stop and wait briefly for it to exit."""
+        """Signal any running profile thread to stop. Does not join — thread is daemon and exits itself."""
         self._profile_stop.set()
-        if self._profile_thread and self._profile_thread.is_alive():
-            self._profile_thread.join(timeout=1.0)
+        self._profile_running = False
         self._profile_thread = None
 
     def _cancel_profile_from_ui(self):
@@ -743,6 +748,7 @@ class SensorGUI:
 
     def _on_profile_finished(self, cancelled=False):
         """Called on the main thread when a profile completes or is cancelled."""
+        self._profile_running = False
         # Hide cancel button
         if hasattr(self, 'cancel_button'):
             self.cancel_button.pack_forget()
@@ -770,6 +776,10 @@ class SensorGUI:
         self.ramp_button.config(state='disabled')
         self.cancel_button.pack(side='left', padx=6, ipady=4)
         self.profile_status_text.set("")
+
+        self._profile_running = True
+        # Clear once at profile start, then log the whole run continuously
+        self.clear_data()
 
         steps = list(range(
             self.PROFILE_START_PCT,
@@ -818,6 +828,10 @@ class SensorGUI:
         self.ramp_button.config(state='disabled')
         self.cancel_button.pack(side='left', padx=6, ipady=4)
         self.profile_status_text.set("")
+
+        self._profile_running = True
+        # Clear once when any profile starts, then log continuously
+        self.clear_data()
 
         TICK_SECS    = 0.5
         start_pct    = float(self.PROFILE_START_PCT)

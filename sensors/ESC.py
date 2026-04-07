@@ -78,7 +78,10 @@ def run_starter(rpm_callback, on_complete):
 
         _set_esc_percent(0)
         print(f"Starter cut — RPM threshold ({STARTER_RPM_THRESHOLD}) reached or stop requested.")
-        on_complete()
+        try:
+            on_complete()
+        except Exception as e:
+            print(f"Starter on_complete error: {e}")
 
     _starter_thread = threading.Thread(target=_worker, daemon=True)
     _starter_thread.start()
