@@ -16,8 +16,8 @@ from rpi_hardware_pwm import HardwarePWM
 # =============================================================================
 
 # --- Tunable throttle pulse range (adjust on physical bench) ---
-THROTTLE_MIN_US = 800   # Pulse width at 0% throttle
-THROTTLE_MAX_US = 1500  # Pulse width at 100% throttle
+THROTTLE_MIN_US = 900   # Pulse width at 0% throttle
+THROTTLE_MAX_US = 1350  # Pulse width at 100% throttle
 
 # --- Choke servo pulse range ---
 CHOKE_OPEN_US  = 2000

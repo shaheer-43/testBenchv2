@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from collections import deque
 import random
+import threading
 import tkinter as tk
 from tkinter import ttk
 from ttkbootstrap import Style, Toplevel, utility
@@ -9,13 +10,16 @@ import time
 from PIL import Image, ImageTk
 
 # Sensor Imports
-
-from sensors.ESC import cut_throttle, run_starter, stop_starter
-from sensors.servos import set_throttle_percent, kill_throttle, reset_kill, toggle_choke
-from sensors.rpm import read_rpm
-from sensors.temp import read_temp
-from sensors.load_cell import read_load_cells
-from sensors.flow import read_flow
+try:
+    from sensors.ESC import cut_throttle, run_starter, stop_starter
+    from sensors.servos import set_throttle_percent, kill_throttle, reset_kill, toggle_choke as servo_toggle_choke
+    from sensors.rpm import read_rpm
+    from sensors.temp import read_temp
+    from sensors.load_cell import read_load_cells
+    from sensors.flow import read_flow
+except Exception as _import_err:
+    print(f"WARNING: Sensor import failed — {_import_err}")
+    print("Running in degraded mode. Hardware calls will fail at runtime.")
 
 # --- Mock Sensor Functions ---
 '''
@@ -39,7 +43,7 @@ def read_sensors():
 # Read all sensor values (real implementation)
 def read_sensors():
     #temp_dict = read_temp()
-    rpm_dict = read_rpm()
+    rpm_dict = read_rpm(duration=0.5)  # 0.5s window — avoids 1s GUI freeze
     load_cell_dict = read_load_cells()
     #flow_dict = read_flow()
 
@@ -59,7 +63,7 @@ class SensorGUI:
         self.root = root
         self.style = Style(theme='flatly') 
         root.title("Engine Control Panel Dashboard")
-        root.geometry("1000x550")
+        root.geometry("1000x620")
         
         # Configure custom styles
         self.style.configure('Custom.TFrame', background='white', bordercolor='#003366', relief='flat', borderwidth=2, border_radius=10)
@@ -85,6 +89,18 @@ class SensorGUI:
         self.after_delay = 1000  # 1 second poll time
         self.waiting_for_readings = 0
         self._excel_buffer = []
+
+        # --- Throttle profile config (edit these to tune behaviour) ---
+        self.PROFILE_START_PCT   = 20    # Both profiles start at this %
+        self.PROFILE_END_PCT     = 100   # Both profiles end at this %
+        self.STEP_SIZE_PCT       = 10    # Step function: increment per step
+        self.STEP_DWELL_SECS     = 20    # Step function: seconds held at each step
+        self.RAMP_DURATION_SECS  = 150   # Ramp function: total ramp time in seconds
+
+        # Shared stop event — set by Kill or a manual cancel to abort any running profile
+        self._profile_stop = threading.Event()
+        self._profile_thread = None
+        self._profile_running = False  # True while step or ramp is active; suppresses data clearing
 
         self.display_widgets = {} 
         self.control_widgets = {}
@@ -308,7 +324,44 @@ class SensorGUI:
 
         ttk.Button(self.slider_frame, text="➕", command=self.increment_throttle, bootstyle='dark', width=5).pack(side='left', padx=8, ipady=3)
         
-        # 5. Save Button
+        # 5. Throttle Profile Buttons  ← move this whole block by cutting/pasting relative to sections 1–6
+        self.profile_frame = ttk.Frame(self.root, padding=(15, 3))
+        self.profile_frame.pack(pady=(2, 4), padx=40, fill='x')
+
+        ttk.Label(
+            self.profile_frame, text="Throttle Profiles",
+            font=('Inter', 10, 'bold'), foreground='#555'
+        ).pack(side='left', padx=(0, 12))
+
+        self.step_button = ttk.Button(
+            self.profile_frame, text="▶  Step (20%→100%, 10% / 20 s)",
+            command=self.run_step_profile,
+            bootstyle='info outline', width=32
+        )
+        self.step_button.pack(side='left', padx=6, ipady=4)
+
+        self.ramp_button = ttk.Button(
+            self.profile_frame, text="▶  Ramp (20%→100% over 150 s)",
+            command=self.run_ramp_profile,
+            bootstyle='warning outline', width=32
+        )
+        self.ramp_button.pack(side='left', padx=6, ipady=4)
+
+        self.cancel_button = ttk.Button(
+            self.profile_frame, text="⏹  Cancel",
+            command=self._cancel_profile_from_ui,
+            bootstyle='secondary', width=12
+        )
+        # Cancel button starts hidden — shown only while a profile runs
+        # To show it: self.cancel_button.pack(side='left', padx=6, ipady=4)
+
+        self.profile_status_text = tk.StringVar(value="")
+        ttk.Label(
+            self.profile_frame, textvariable=self.profile_status_text,
+            font=('Inter', 9), foreground='#777'
+        ).pack(side='left', padx=(10, 0))
+
+        # 6. Save Button
         ttk.Button(
             self.root, text="Save Data and Exit", command=self.save_data_and_close, 
             style='Control.TButton', bootstyle='light', width=20
@@ -523,15 +576,21 @@ class SensorGUI:
         
     # --- Control Handlers ---
 
-    def on_throttle_change(self, event=None):
-        """Updates throttle display and sends percent to servo. Locked when slider disabled."""
+    def on_throttle_change(self, event=None, from_profile=False):
+        """Updates throttle. If a profile is running and manual input occurs, cancels profile."""
         if not self.slider_enabled:
             return
+        # Manual input while a profile is running — cancel the profile
+        if not from_profile and self._profile_thread and self._profile_thread.is_alive():
+            self._stop_profile()
+            self._on_profile_finished(cancelled=True)
         throttle_pct = round(self.throttle_var.get(), 1)
         self.percent_text.set(f"{throttle_pct:.0f}%")
         set_throttle_percent(throttle_pct)
-        self.clear_data()
-        self.waiting_for_readings = 0
+        # Only clear data on manual throttle changes, not during profiles
+        if not self._profile_running:
+            self.clear_data()
+            self.waiting_for_readings = 0
 
     def update_servo_angle(self, percent=None):
         """Send a throttle percent to the servo (used internally)."""
@@ -546,7 +605,7 @@ class SensorGUI:
         self.throttle_var.set(new_value)
         if hasattr(self, 'slider_canvas'):
             self._update_handle_position(self._value_to_x(new_value))
-        self.on_throttle_change()
+        self.on_throttle_change()  # on_throttle_change handles profile cancellation
 
     def decrement_throttle(self):
         if not self.slider_enabled:
@@ -555,7 +614,7 @@ class SensorGUI:
         self.throttle_var.set(new_value)
         if hasattr(self, 'slider_canvas'):
             self._update_handle_position(self._value_to_x(new_value))
-        self.on_throttle_change()
+        self.on_throttle_change()  # on_throttle_change handles profile cancellation
 
     def update_choke_indicators(self):
         """Helper to update the visual state of the Choke block."""
@@ -570,33 +629,36 @@ class SensorGUI:
         red_canvas.itemconfig(red_id, fill='gray' if is_open else 'red')
         
     def toggle_choke(self):
-        """Toggles the choke state and manages the initial delay."""
+        """Toggles the choke state, updates indicators, and drives the choke servo."""
         current_state = self.choke_state.get()
         self.choke_state.set(not current_state)
         self.update_choke_indicators()
 
         if self.choke_state.get():
-            # Choke is now OPEN (ON) - start delay, set button text to "Choke: Open"
             self.choke_text.set("Choke: Open")
+            servo_toggle_choke(True)   # Drive choke servo open
             self.waiting_for_readings = self.wait_time_after_choke
             self.status_label_text.set(f"Choke OPEN. Starting {self.wait_time_after_choke}s delay...")
             self.status_label.config(style='Danger.TLabel')
         else:
-            # Choke is now CLOSED (OFF) - clear data, set button text to "Choke: Closed"
             self.choke_text.set("Choke: Closed")
+            servo_toggle_choke(False)  # Drive choke servo closed
             self.clear_data()
             self.status_label_text.set("Choke CLOSED. Data Cleared.")
             self.status_label.config(style='Success.TLabel')
 
     def _update_engine_buttons(self):
-        """Enable/disable Start and Kill buttons based on engine state."""
+        """Enable/disable Start, Kill, and profile buttons based on engine state."""
         state = self.engine_state
-        # Start only available when idle or killed
-        start_state = 'normal' if state in ('idle', 'killed') else 'disabled'
-        # Kill available whenever engine is starting or running
-        kill_state = 'normal' if state in ('starting', 'running') else 'disabled'
+        start_state   = 'normal'   if state in ('idle', 'killed')       else 'disabled'
+        kill_state    = 'normal'   if state in ('starting', 'running')  else 'disabled'
+        profile_state = 'normal'   if state == 'running'                else 'disabled'
         self.start_button.config(state=start_state)
         self.kill_button.config(state=kill_state)
+        # Profile buttons only exist after create_layout has run
+        if hasattr(self, 'step_button'):
+            self.step_button.config(state=profile_state)
+            self.ramp_button.config(state=profile_state)
         self.engine_status_text.set(f"State: {state.capitalize()}")
 
     def start_engine(self):
@@ -640,10 +702,14 @@ class SensorGUI:
     def kill_engine(self):
         """
         Hard kill:
+          - Cancels any running throttle profile
           - Stop starter thread if still running
-          - Drive throttle servo to 0% (minimum pulse) and lock slider
+          - Drive throttle servo to 0% and lock slider
           - Cut ESC
         """
+        # Cancel any running step/ramp profile
+        self._stop_profile()
+
         stop_starter()
         kill_throttle()
         cut_throttle()
@@ -656,6 +722,149 @@ class SensorGUI:
         self._update_engine_buttons()
         self.status_label_text.set("ENGINE KILLED — throttle at 0%.")
         self.status_label.config(style='Danger.TLabel')
+
+    # --- Throttle Profile Logic ---
+
+    def _set_throttle_and_update_ui(self, percent):
+        """Send throttle percent to servo and keep slider/label in sync (main-thread safe via root.after)."""
+        def _do():
+            set_throttle_percent(percent)
+            self.throttle_var.set(percent)
+            self.percent_text.set(f"{percent:.0f}%")
+            if hasattr(self, 'slider_canvas'):
+                self._update_handle_position(self._value_to_x(percent))
+        self.root.after(0, _do)
+
+    def _stop_profile(self):
+        """Signal any running profile thread to stop. Does not join — thread is daemon and exits itself."""
+        self._profile_stop.set()
+        self._profile_running = False
+        self._profile_thread = None
+
+    def _cancel_profile_from_ui(self):
+        """Called when the user explicitly presses the Cancel button."""
+        self._stop_profile()
+        self._on_profile_finished(cancelled=True)
+
+    def _on_profile_finished(self, cancelled=False):
+        """Called on the main thread when a profile completes or is cancelled."""
+        self._profile_running = False
+        # Hide cancel button
+        if hasattr(self, 'cancel_button'):
+            self.cancel_button.pack_forget()
+        if hasattr(self, 'step_button'):
+            self.step_button.config(state='normal')
+            self.ramp_button.config(state='normal')
+        msg = "Profile cancelled." if cancelled else "Profile complete."
+        self.profile_status_text.set(msg)
+
+    def run_step_profile(self):
+        """
+        Step Function: 20% → 100% in STEP_SIZE_PCT increments.
+        Dwells STEP_DWELL_SECS at each step before advancing.
+        Manual slider/buttons cancel the profile and take over.
+        Kill button also cancels immediately.
+        """
+        if self.engine_state != 'running':
+            return
+
+        self._stop_profile()
+        self._profile_stop.clear()
+
+        # Disable the other profile button, show cancel
+        self.step_button.config(state='disabled')
+        self.ramp_button.config(state='disabled')
+        self.cancel_button.pack(side='left', padx=6, ipady=4)
+        self.profile_status_text.set("")
+
+        self._profile_running = True
+        # Clear once at profile start, then log the whole run continuously
+        self.clear_data()
+
+        steps = list(range(
+            self.PROFILE_START_PCT,
+            self.PROFILE_END_PCT + 1,
+            self.STEP_SIZE_PCT
+        ))
+        if steps[-1] != self.PROFILE_END_PCT:
+            steps.append(self.PROFILE_END_PCT)
+
+        def _worker():
+            for pct in steps:
+                if self._profile_stop.is_set():
+                    self.root.after(0, lambda: self._on_profile_finished(cancelled=True))
+                    return
+                self._set_throttle_and_update_ui(pct)
+                self.root.after(0, lambda p=pct: self.profile_status_text.set(
+                    f"Step: {p}% — holding for {self.STEP_DWELL_SECS}s..."
+                ))
+                for _ in range(self.STEP_DWELL_SECS * 10):
+                    if self._profile_stop.is_set():
+                        self.root.after(0, lambda: self._on_profile_finished(cancelled=True))
+                        return
+                    time.sleep(0.1)
+
+            self.root.after(0, lambda: self._on_profile_finished(cancelled=False))
+
+        self._profile_thread = threading.Thread(target=_worker, daemon=True)
+        self._profile_thread.start()
+
+    def run_ramp_profile(self):
+        """
+        Ramp Function: linearly sweeps throttle from PROFILE_START_PCT to
+        PROFILE_END_PCT over RAMP_DURATION_SECS seconds.
+        Updates the servo every 0.5 s for a smooth ramp.
+        Manual slider/buttons cancel the profile and take over.
+        Kill button also cancels immediately.
+        """
+        if self.engine_state != 'running':
+            return
+
+        self._stop_profile()
+        self._profile_stop.clear()
+
+        # Disable the other profile button, show cancel
+        self.step_button.config(state='disabled')
+        self.ramp_button.config(state='disabled')
+        self.cancel_button.pack(side='left', padx=6, ipady=4)
+        self.profile_status_text.set("")
+
+        self._profile_running = True
+        # Clear once when any profile starts, then log continuously
+        self.clear_data()
+
+        TICK_SECS    = 0.5
+        start_pct    = float(self.PROFILE_START_PCT)
+        end_pct      = float(self.PROFILE_END_PCT)
+        total_secs   = float(self.RAMP_DURATION_SECS)
+        pct_per_tick = (end_pct - start_pct) / (total_secs / TICK_SECS)
+
+        def _worker():
+            current_pct = start_pct
+            elapsed = 0.0
+
+            while current_pct <= end_pct:
+                if self._profile_stop.is_set():
+                    self.root.after(0, lambda: self._on_profile_finished(cancelled=True))
+                    return
+
+                send_pct = min(current_pct, end_pct)
+                self._set_throttle_and_update_ui(send_pct)
+
+                remaining = total_secs - elapsed
+                self.root.after(0, lambda p=send_pct, r=remaining: self.profile_status_text.set(
+                    f"Ramp: {p:.1f}% — {r:.0f}s remaining"
+                ))
+
+                time.sleep(TICK_SECS)
+                current_pct += pct_per_tick
+                elapsed += TICK_SECS
+
+            self._set_throttle_and_update_ui(end_pct)
+            self.root.after(0, lambda: self._on_profile_finished(cancelled=False))
+
+        self._profile_thread = threading.Thread(target=_worker, daemon=True)
+        self._profile_thread.start()
 
     # --- Polling Logic ---
 
@@ -753,6 +962,7 @@ class SensorGUI:
         
         # Clean up hardware before closing
         try:
+            self._stop_profile()
             from sensors.servos import cleanup as servo_cleanup
             from sensors.ESC import cleanup as esc_cleanup
             servo_cleanup()
