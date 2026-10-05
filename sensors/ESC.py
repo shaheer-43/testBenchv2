@@ -6,11 +6,14 @@ import lgpio
 ESC_PIN = 12
 
 # --- ESC pulse range ---
-ESC_MIN_US = 1000   # 0%   throttle
-ESC_MAX_US = 2000   # 100% throttle
+ESC_MIN_US = 1000   # 0%   ESC output
+ESC_MAX_US = 2000   # 100% ESC output
 
 # --- RPM threshold at which the starter cuts off automatically ---
 STARTER_RPM_THRESHOLD = 3000
+
+# --- Maximum time to crank before giving up (seconds) ---
+STARTER_TIMEOUT_SECS = 30
 
 # Open GPIO chip and claim pin
 h = lgpio.gpiochip_open(0)
@@ -36,7 +39,7 @@ def _set_esc_percent(percent):
 # Public API
 # ---------------------------------------------------------------------------
 
-def cut_throttle():
+def cut_esc():
     """Immediately cut the ESC to 0."""
     _set_esc_percent(0)
 
@@ -62,6 +65,9 @@ def run_starter(rpm_callback, on_complete):
         _set_esc_percent(100)
         print("Starter running at 100%...")
 
+        start_time = time.time()
+        timed_out = False
+
         while not _starter_stop_event.is_set():
             try:
                 rpm = rpm_callback()
@@ -74,12 +80,17 @@ def run_starter(rpm_callback, on_complete):
             if rpm >= STARTER_RPM_THRESHOLD:
                 break
 
+            if time.time() - start_time >= STARTER_TIMEOUT_SECS:
+                timed_out = True
+                print(f"Starter timed out after {STARTER_TIMEOUT_SECS}s — engine did not start.")
+                break
+
             time.sleep(0.2)
 
         _set_esc_percent(0)
         print(f"Starter cut — RPM threshold ({STARTER_RPM_THRESHOLD}) reached or stop requested.")
         try:
-            on_complete()
+            on_complete(timed_out)
         except Exception as e:
             print(f"Starter on_complete error: {e}")
 

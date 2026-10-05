@@ -11,15 +11,45 @@ from PIL import Image, ImageTk
 
 # Sensor Imports
 try:
-    from sensors.ESC import cut_throttle, run_starter, stop_starter
+    from sensors.ESC import cut_esc, run_starter, stop_starter
+except Exception as e:
+    print(f"WARNING: ESC import failed — {e}")
+    def cut_esc(): pass
+    def run_starter(rpm_callback, on_complete): on_complete(False)
+    def stop_starter(): pass
+
+try:
     from sensors.servos import set_throttle_percent, kill_throttle, reset_kill, toggle_choke as servo_toggle_choke
+except Exception as e:
+    print(f"WARNING: Servos import failed — {e}")
+    def set_throttle_percent(p): pass
+    def kill_throttle(): pass
+    def reset_kill(): pass
+    def servo_toggle_choke(state): pass
+
+try:
     from sensors.rpm import read_rpm
-    from sensors.temp import read_temp
+except Exception as e:
+    print(f"WARNING: RPM import failed — {e}")
+    def read_rpm(duration=1): return {"rpm": 0.0, "pulses": 0}
+
+try:
+    from sensors.temp import read_temperature
+except Exception as e:
+    print(f"WARNING: Temperature import failed — {e}")
+    def read_temperature(): return 0.0
+
+try:
     from sensors.load_cell import read_load_cells
+except Exception as e:
+    print(f"WARNING: Load cell import failed — {e}")
+    def read_load_cells(): return {"Load Cell 1 (Raw)": 0.0, "Load Cell 1 (Filtered)": 0.0, "Load Cell 1 (Stable)": 0.0, "Load Cell 2 (Raw)": 0.0, "Load Cell 2 (Filtered)": 0.0, "Load Cell 2 (Stable)": 0.0}
+
+try:
     from sensors.flow import read_flow
-except Exception as _import_err:
-    print(f"WARNING: Sensor import failed — {_import_err}")
-    print("Running in degraded mode. Hardware calls will fail at runtime.")
+except Exception as e:
+    print(f"WARNING: Flow import failed — {e}")
+    def read_flow(): return {"grams_per_min": 0.0, "liters_per_min": 0.0}
 
 # --- Mock Sensor Functions ---
 '''
@@ -40,20 +70,61 @@ def read_sensors():
     return sensor_values
 '''
 
-# Read all sensor values (real implementation)
+# Read all sensor values — each sensor runs in parallel to avoid sequential delays
 def read_sensors():
-    #temp_dict = read_temp()
-    rpm_dict = read_rpm(duration=0.5)  # 0.5s window — avoids 1s GUI freeze
-    load_cell_dict = read_load_cells()
-    #flow_dict = read_flow()
+    results = {}
+    errors = {}
+
+    def _rpm():
+        try:
+            results['rpm'] = read_rpm(duration=0.5)
+        except Exception as e:
+            errors['rpm'] = e
+            results['rpm'] = {"rpm": 0.0, "pulses": 0}
+
+    def _load_cells():
+        try:
+            results['load_cells'] = read_load_cells()
+        except Exception as e:
+            errors['load_cells'] = e
+            results['load_cells'] = {"Load Cell 1 (Raw)": 0.0, "Load Cell 2 (Raw)": 0.0}
+
+    def _temp():
+        try:
+            results['temp'] = read_temperature()
+        except Exception as e:
+            errors['temp'] = e
+            results['temp'] = 0.0
+
+    def _flow():
+        try:
+            results['flow'] = read_flow()
+        except Exception as e:
+            errors['flow'] = e
+            results['flow'] = {"grams_per_min": 0.0, "liters_per_min": 0.0}
+
+    threads = [
+        threading.Thread(target=_rpm, daemon=True),
+        threading.Thread(target=_load_cells, daemon=True),
+        threading.Thread(target=_temp, daemon=True),
+        threading.Thread(target=_flow, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=3.0)  # Max 3s wait per sensor before giving up
+
+    if errors:
+        for sensor, err in errors.items():
+            print(f"Sensor warning ({sensor}): {err}")
 
     return {
-        "Temperature": round(random.uniform(15, 100), 2),
-        "RPM": rpm_dict['rpm'],
-        "Load Cell 1": load_cell_dict['Load Cell 1 (Raw)'],
-        "Load Cell 2": load_cell_dict['Load Cell 2 (Raw)'],
-        "grams_per_min": round(random.uniform(0, 2000), 2),
-        "liters_per_min": round(random.uniform(0, 2000), 2)
+        "Temperature": round(results['temp'], 2) if results.get('temp') is not None else 0.0,
+        "RPM": results.get('rpm', {}).get('rpm', 0.0),
+        "Load Cell 1": results.get('load_cells', {}).get('Load Cell 1 (Raw)', 0.0),
+        "Load Cell 2": results.get('load_cells', {}).get('Load Cell 2 (Raw)', 0.0),
+        "grams_per_min": results.get('flow', {}).get('grams_per_min', 0.0),
+        "liters_per_min": results.get('flow', {}).get('liters_per_min', 0.0),
     }
 
 # --- GUI Implementation ---
@@ -131,6 +202,11 @@ class SensorGUI:
         
         # Initialize button states
         self._update_engine_buttons()
+        # Ensure throttle is live on startup
+        try:
+            reset_kill()
+        except Exception:
+            pass
 
     def create_indicator_block(self, parent, data_key, label_text, unit, row, col):
         """Creates one of the four top bordered display blocks with current and avg data."""
@@ -341,8 +417,8 @@ class SensorGUI:
         self.step_button.pack(side='left', padx=6, ipady=4)
 
         self.ramp_button = ttk.Button(
-            self.profile_frame, text="▶  Ramp (20%→100% over 150 s)",
-            command=self.run_ramp_profile,
+            self.profile_frame, text="▶  Ramp (custom target & time)...",
+            command=self.prompt_ramp_profile,
             bootstyle='warning outline', width=32
         )
         self.ramp_button.pack(side='left', padx=6, ipady=4)
@@ -652,7 +728,7 @@ class SensorGUI:
         state = self.engine_state
         start_state   = 'normal'   if state in ('idle', 'killed')       else 'disabled'
         kill_state    = 'normal'   if state in ('starting', 'running')  else 'disabled'
-        profile_state = 'normal'   if state == 'running'                else 'disabled'
+        profile_state = 'disabled' if state == 'starting' else 'normal'
         self.start_button.config(state=start_state)
         self.kill_button.config(state=kill_state)
         # Profile buttons only exist after create_layout has run
@@ -685,19 +761,26 @@ class SensorGUI:
         def get_rpm():
             return read_rpm(duration=0.2)['rpm']
 
-        def on_starter_complete():
-            # Called from background thread — schedule GUI update on main thread
-            self.root.after(0, self._on_engine_started)
+        def on_starter_complete(timed_out=False):
+            self.root.after(0, lambda: self._on_engine_started(timed_out))
 
         run_starter(rpm_callback=get_rpm, on_complete=on_starter_complete)
 
-    def _on_engine_started(self):
-        """Called on the main thread once RPM threshold is reached."""
-        self.engine_state = 'running'
-        self.slider_enabled = True
-        self._update_engine_buttons()
-        self.status_label_text.set("Engine running — starter cut at 3000 RPM.")
-        self.status_label.config(style='Success.TLabel')
+    def _on_engine_started(self, timed_out=False):
+        """Called on the main thread once starter cuts."""
+        reset_kill()
+        if timed_out:
+            self.engine_state = 'idle'
+            self.slider_enabled = False
+            self._update_engine_buttons()
+            self.status_label_text.set("Engine did not start — timed out after 30s.")
+            self.status_label.config(style='Danger.TLabel')
+        else:
+            self.engine_state = 'running'
+            self.slider_enabled = True
+            self._update_engine_buttons()
+            self.status_label_text.set("Engine running — starter cut at 3000 RPM.")
+            self.status_label.config(style='Success.TLabel')
 
     def kill_engine(self):
         """
@@ -712,7 +795,7 @@ class SensorGUI:
 
         stop_starter()
         kill_throttle()
-        cut_throttle()
+        cut_esc()
         self.engine_state = 'killed'
         self.slider_enabled = False
         self.throttle_var.set(0)
@@ -765,7 +848,7 @@ class SensorGUI:
         Manual slider/buttons cancel the profile and take over.
         Kill button also cancels immediately.
         """
-        if self.engine_state != 'running':
+        if self.engine_state == 'starting':
             return
 
         self._stop_profile()
@@ -809,59 +892,107 @@ class SensorGUI:
         self._profile_thread = threading.Thread(target=_worker, daemon=True)
         self._profile_thread.start()
 
-    def run_ramp_profile(self):
+    def prompt_ramp_profile(self):
+        """Show a dialog to collect ramp target % and duration before starting."""
+        if self.engine_state == 'starting':
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Configure Ramp")
+        dialog.geometry("300x200")
+        dialog.resizable(False, False)
+        dialog.grab_set()  # Modal
+
+        ttk.Label(dialog, text="Ramp Target (%)", font=('Inter', 10)).pack(pady=(18, 2))
+        target_var = tk.StringVar(value=str(self.PROFILE_END_PCT))
+        target_entry = ttk.Entry(dialog, textvariable=target_var, width=10, justify='center')
+        target_entry.pack()
+
+        ttk.Label(dialog, text="Ramp Duration (seconds)", font=('Inter', 10)).pack(pady=(12, 2))
+        duration_var = tk.StringVar(value=str(self.RAMP_DURATION_SECS))
+        duration_entry = ttk.Entry(dialog, textvariable=duration_var, width=10, justify='center')
+        duration_entry.pack()
+
+        error_var = tk.StringVar(value="")
+        ttk.Label(dialog, textvariable=error_var, foreground='red', font=('Inter', 9)).pack(pady=4)
+
+        def _start():
+            try:
+                target = float(target_var.get())
+                duration = float(duration_var.get())
+                if not (1 <= target <= 100):
+                    error_var.set("Target must be between 1 and 100.")
+                    return
+                if duration <= 0:
+                    error_var.set("Duration must be greater than 0.")
+                    return
+            except ValueError:
+                error_var.set("Please enter valid numbers.")
+                return
+            dialog.destroy()
+            self.run_ramp_profile(end_pct=target, total_secs=duration)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=6)
+        ttk.Button(btn_frame, text="Start", command=_start, bootstyle='warning').pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy, bootstyle='secondary').pack(side='left', padx=6)
+
+    def run_ramp_profile(self, end_pct=None, total_secs=None):
         """
         Ramp Function: linearly sweeps throttle from PROFILE_START_PCT to
-        PROFILE_END_PCT over RAMP_DURATION_SECS seconds.
-        Updates the servo every 0.5 s for a smooth ramp.
+        end_pct over total_secs seconds. Parameters come from the prompt dialog.
+        Updates the servo every 0.5s for a smooth ramp.
         Manual slider/buttons cancel the profile and take over.
         Kill button also cancels immediately.
         """
-        if self.engine_state != 'running':
+        if self.engine_state == 'starting':
             return
+
+        end_pct    = float(end_pct   if end_pct    is not None else self.PROFILE_END_PCT)
+        total_secs = float(total_secs if total_secs is not None else self.RAMP_DURATION_SECS)
 
         self._stop_profile()
         self._profile_stop.clear()
 
-        # Disable the other profile button, show cancel
         self.step_button.config(state='disabled')
         self.ramp_button.config(state='disabled')
         self.cancel_button.pack(side='left', padx=6, ipady=4)
         self.profile_status_text.set("")
 
         self._profile_running = True
-        # Clear once when any profile starts, then log continuously
         self.clear_data()
 
         TICK_SECS    = 0.5
         start_pct    = float(self.PROFILE_START_PCT)
-        end_pct      = float(self.PROFILE_END_PCT)
-        total_secs   = float(self.RAMP_DURATION_SECS)
-        pct_per_tick = (end_pct - start_pct) / (total_secs / TICK_SECS)
+        pct_per_tick = (end_pct - start_pct) / max(total_secs / TICK_SECS, 1)
 
         def _worker():
-            current_pct = start_pct
-            elapsed = 0.0
+            try:
+                current_pct = start_pct
+                elapsed = 0.0
 
-            while current_pct <= end_pct:
-                if self._profile_stop.is_set():
-                    self.root.after(0, lambda: self._on_profile_finished(cancelled=True))
-                    return
+                while current_pct <= end_pct:
+                    if self._profile_stop.is_set():
+                        self.root.after(0, lambda: self._on_profile_finished(cancelled=True))
+                        return
 
-                send_pct = min(current_pct, end_pct)
-                self._set_throttle_and_update_ui(send_pct)
+                    send_pct = min(current_pct, end_pct)
+                    self._set_throttle_and_update_ui(send_pct)
 
-                remaining = total_secs - elapsed
-                self.root.after(0, lambda p=send_pct, r=remaining: self.profile_status_text.set(
-                    f"Ramp: {p:.1f}% — {r:.0f}s remaining"
-                ))
+                    remaining = max(0.0, total_secs - elapsed)
+                    self.root.after(0, lambda p=send_pct, r=remaining: self.profile_status_text.set(
+                        f"Ramp: {p:.1f}% — {r:.0f}s remaining"
+                    ))
 
-                time.sleep(TICK_SECS)
-                current_pct += pct_per_tick
-                elapsed += TICK_SECS
+                    time.sleep(TICK_SECS)
+                    current_pct += pct_per_tick
+                    elapsed += TICK_SECS
 
-            self._set_throttle_and_update_ui(end_pct)
-            self.root.after(0, lambda: self._on_profile_finished(cancelled=False))
+                self._set_throttle_and_update_ui(end_pct)
+                self.root.after(0, lambda: self._on_profile_finished(cancelled=False))
+            except Exception as e:
+                print(f"Ramp profile error: {e}")
+                self.root.after(0, lambda: self._on_profile_finished(cancelled=True))
 
         self._profile_thread = threading.Thread(target=_worker, daemon=True)
         self._profile_thread.start()
@@ -869,70 +1000,88 @@ class SensorGUI:
     # --- Polling Logic ---
 
     def poll_sensors(self):
-        """Polls sensors, handles choke delay, and updates GUI."""
+        """Polls sensors in a background thread — always runs regardless of engine state."""
         if not self.root.winfo_exists():
             return
-            
-        should_poll = False
 
-        if self.engine_state == 'running':
-            if self.choke_state.get():
-                # Choke is OPEN: Enforce delay logic
-                if self.waiting_for_readings > 0:
-                    self.waiting_for_readings -= 1
-                    self.status_label_text.set(
-                        f"Choke OPEN. Delay: {self.waiting_for_readings} cycles remaining..."
-                    )
-                    self.status_label.config(style='Danger.TLabel')
-                else:
-                    # Delay elapsed: Poll sensors
-                    should_poll = True
-            else:
-                # Choke is CLOSED: Poll sensors immediately
-                should_poll = False
+        # Choke delay: count down and skip this cycle
+        if self.choke_state.get() and self.waiting_for_readings > 0:
+            self.waiting_for_readings -= 1
+            self.status_label_text.set(
+                f"Choke OPEN. Delay: {self.waiting_for_readings} cycles remaining..."
+            )
+            self.status_label.config(style='Danger.TLabel')
+            self.root.after(self.after_delay, self.poll_sensors)
+            return
 
-        if should_poll:
-            values = read_sensors()
-            if not values or any(v is None for v in values.values()):
-                self.status_label_text.set("Sensor missing, skipping cycle...")
-                # If a reading fails, re-enforce the delay if the choke is open, 
-                # to prevent rapid logging of bad data.
-                if self.choke_state.get():
-                    self.waiting_for_readings = self.wait_time_after_choke
-            else:
-                self._process_and_update_values(values)
-                self.status_label_text.set(f"Sampling Active.")
-                self.status_label.config(style='Success.TLabel')
-        #elif not self.sensor_active:
-            # Update status if engine is cut
-           # self.status_label_text.set("Engine CUT. Polling Paused.")
-           # self.status_label.config(style='Danger.TLabel')
-        
-        # If the status was updated by the choke delay, don't overwrite it here.
-        
+        def _read():
+            try:
+                values = read_sensors()
+                self.root.after(0, lambda: self._on_sensor_result(values))
+            except Exception as e:
+                self.root.after(0, lambda err=e: self._on_sensor_error(err))
+
+        threading.Thread(target=_read, daemon=True).start()
         self.root.after(self.after_delay, self.poll_sensors)
+
+    def _on_sensor_result(self, values):
+        """Called on main thread with sensor results."""
+        try:
+            if not values:
+                self.status_label_text.set("No sensor data, skipping cycle...")
+                return
+            # Replace any None values with 0.0 rather than skipping the whole cycle
+            clean = {k: (v if v is not None else 0.0) for k, v in values.items()}
+            self._process_and_update_values(clean)
+            self.status_label_text.set("Sampling Active.")
+            self.status_label.config(style='Success.TLabel')
+        except Exception as e:
+            print(f"_on_sensor_result error: {e}")
+
+    def _on_sensor_error(self, err):
+        """Called on main thread when sensor read throws an exception."""
+        try:
+            self.status_label_text.set(f"Sensor error: {err}")
+            self.status_label.config(style='Danger.TLabel')
+        except Exception:
+            pass
 
     def _process_and_update_values(self, sensor_values):
         """Updates internal deques and GUI labels based on new sensor data."""
-        timestamp = time.time()
-        excel_row = {'Time': timestamp, 'Throttle': int(self.throttle_var.get())}
-        
-        for key, value in sensor_values.items():
-            self.sensor_data[key].append(value)
-            excel_row[key] = value
+        try:
+            timestamp = time.time()
+            excel_row = {'Time': timestamp, 'Throttle': int(self.throttle_var.get())}
 
-            if key in self.display_widgets:
-                widget_data = self.display_widgets[key]
-                unit = widget_data['unit']
-                
-                widget_data['current'].set(f"{value:.2f}")
+            for key, value in sensor_values.items():
+                try:
+                    # Coerce to float safely
+                    value = float(value) if value is not None else 0.0
+                except (TypeError, ValueError):
+                    value = 0.0
 
-                latest_readings = list(self.sensor_data[key])
-                if len(latest_readings) >= self.moving_avg_window:
-                    avg_value = np.mean(latest_readings[-self.moving_avg_window:])
-                    widget_data['avg'].set(f"Avg: {avg_value:.2f}")
-        
-        self._excel_buffer.append(excel_row)
+                try:
+                    self.sensor_data[key].append(value)
+                except Exception:
+                    pass
+
+                excel_row[key] = value
+
+                if key in self.display_widgets:
+                    try:
+                        widget_data = self.display_widgets[key]
+                        widget_data['current'].set(f"{value:.2f}")
+
+                        latest_readings = list(self.sensor_data[key])
+                        if len(latest_readings) >= self.moving_avg_window:
+                            avg_value = np.mean(latest_readings[-self.moving_avg_window:])
+                            widget_data['avg'].set(f"Avg: {avg_value:.2f}")
+                    except Exception as e:
+                        print(f"Display update error ({key}): {e}")
+
+            self._excel_buffer.append(excel_row)
+
+        except Exception as e:
+            print(f"_process_and_update_values error: {e}")
 
     # --- Exit Logic ---
 
@@ -960,6 +1109,16 @@ class SensorGUI:
             except Exception as e:
                 self.show_modal("File Error", f"Failed to save data to Excel. Error: {e}", style='danger', size=(400, 200))
         
+        # Clean up hardware before closing
+        try:
+            self._stop_profile()
+            from sensors.servos import cleanup as servo_cleanup
+            from sensors.ESC import cleanup as esc_cleanup
+            servo_cleanup()
+            esc_cleanup()
+        except Exception:
+            pass
+
         # Clean up hardware before closing
         try:
             self._stop_profile()
